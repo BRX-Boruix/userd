@@ -23,6 +23,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use libsys::*;
 
 /// 账户记录（/config/users.json 的 users[] 元素）。
@@ -167,8 +168,12 @@ fn write_file(path: &str, data: &[u8]) -> Result<(), Error> {
 fn ensure_home(acc: &Account) {
     let mut path = String::from("/users/");
     path.push_str(&acc.name);
+    // 状态变化标志：仅当本轮**实际改动**了盘上状态（新建家目录 / 重写投影）
+    // 才打 "home ready"。对账循环每 10s 跑一轮，若无变化仍每轮打印，
+    // 同一行会无限刷屏（用户实测报告的日志噪音）。
+    let mut changed = false;
     match mkdir(&path, Permissions::all()) {
-        Ok(_) => {}
+        Ok(_) => changed = true,
         // 已存在：幂等容忍。
         Err(Error::AlreadyExists) => {}
         Err(e) => {
@@ -197,21 +202,34 @@ fn ensure_home(acc: &Account) {
     if stale {
         if let Err(e) = write_file(&ipath, want.as_bytes()) {
             logf(format_args!("write {} failed: {:?}", ipath, e));
+        } else {
+            changed = true;
         }
     }
-    logf(format_args!("home ready: {} ({}:{})", path, acc.uid, acc.gid));
+    // 幂等无变化时保持沉默：状态没变就不重复广播（失败日志不受影响——
+    // 错误是新的信息，成功不是）。
+    if changed {
+        logf(format_args!("home ready: {} ({}:{})", path, acc.uid, acc.gid));
+    }
 }
 
 /// 对账一轮：读账户表 → 逐账户 ensure_home。
 /// 账户表缺失 → 如实记录并等下一轮（不伪造空账户，不退出——表可能稍后出现）。
+/// "账户表还没出现"已报过（对账循环 10s 一轮，若每轮打印同一句等于刷屏）。
+/// 出现后复位——这样"消失再出现"仍会如实报告，未消失则只报一次。
+static WAIT_USERS_REPORTED: AtomicBool = AtomicBool::new(false);
+
 fn reconcile() {
     let bytes = match read_file("/config/users.json") {
         Some(b) => b,
         None => {
-            log(b"no /config/users.json yet; waiting");
+            if !WAIT_USERS_REPORTED.swap(true, Ordering::Relaxed) {
+                log(b"no /config/users.json yet; waiting");
+            }
             return;
         }
     };
+    WAIT_USERS_REPORTED.store(false, Ordering::Relaxed);
     let accounts = parse_accounts(&bytes);
     if accounts.is_empty() {
         log(b"users.json empty/malformed; nothing to do");
@@ -353,25 +371,37 @@ fn ensure_group_dir(rec: &GroupRecord) {
         Some(cur) => cur != want.as_bytes(),
         None => true,
     };
+    // 与 ensure_home 同纪律：仅实际建投影时打 "group ready"，幂等轮空则沉默。
+    let mut changed = false;
     if stale {
         if let Err(e) = write_file(&path, want.as_bytes()) {
             logf(format_args!("write {} failed: {:?}", path, e));
+        } else {
+            changed = true;
         }
     }
-    logf(format_args!("group ready: {} (gid {}, {} member(s))", rec.name, rec.gid, rec.members.len()));
+    if changed {
+        logf(format_args!("group ready: {} (gid {}, {} member(s))", rec.name, rec.gid, rec.members.len()));
+    }
 }
 
 /// 同步组表：读 /config/groups.json → 逐组建投影。
 /// **表缺失如实记录并等下一轮**（不伪造空组表，不退出——表可能稍后出现）。
 /// 返回 None 表示表暂不可读（调用方据此区分"没有组"与"还没读到组表"）。
+/// "组表还没出现"已报过（同 WAIT_USERS_REPORTED：只报一次，出现后复位）。
+static WAIT_GROUPS_REPORTED: AtomicBool = AtomicBool::new(false);
+
 fn reconcile_groups() -> Option<usize> {
     let bytes = match read_file("/config/groups.json") {
         Some(b) => b,
         None => {
-            log(b"no /config/groups.json yet; waiting");
+            if !WAIT_GROUPS_REPORTED.swap(true, Ordering::Relaxed) {
+                log(b"no /config/groups.json yet; waiting");
+            }
             return None;
         }
     };
+    WAIT_GROUPS_REPORTED.store(false, Ordering::Relaxed);
     let groups = parse_groups(&bytes);
     if groups.is_empty() {
         log(b"groups.json empty/malformed; nothing to do");
